@@ -256,7 +256,15 @@ def prepare_exl3_checkpoint(
     requested bitrate if it is not already an EXL3 checkpoint, patches
     transformers, and returns an :class:`Exl3LoadPlan`.
     """
-    require_exllama()
+    try:
+        import torch
+        _rocm = torch.version.hip is not None
+    except Exception:
+        _rocm = False
+
+    if not _rocm:
+        require_exllama()
+
     cfg = resolve_exl3_config(
         load_in_exl3, quantization_config, compute_dtype = compute_dtype, calibrate = calibrate
     )
@@ -286,6 +294,13 @@ def prepare_exl3_checkpoint(
             config = cfg,
             was_quantized = False,
             source_model = model_name,
+        )
+
+    if _rocm:
+        raise ValueError(
+            "Unsloth: the ROCm EXL3 path currently loads pre-quantized "
+            "EXL3 checkpoints only. Quantizing a dense model to EXL3 still "
+            "requires ExLlamaV3's CUDA converter."
         )
 
     # An explicit EXL3 request for an architecture ExLlamaV3 does not implement
@@ -343,9 +358,10 @@ def prepare_exl3_checkpoint(
 
 def finalize_exl3_model(model, compute_dtype = None) -> int:
     """Stamp EXL3 quant states onto a freshly loaded model. Returns layer count."""
-    if not is_exllama_available():
-        return 0
     import torch
+
+    if torch.version.hip is None and not is_exllama_available():
+        return 0
 
     from .quant_linear import attach_exl3_quant_states, densify_exl3_head
 
@@ -382,9 +398,15 @@ def finalize_exl3_experts(
     has > 32 experts per layer, dense otherwise; ``1`` forces quantized, ``0``
     forces dense).
     """
+    import torch
+
+    # The first ROCm milestone targets dense pre-quantized EXL3 models.
+    # ExLlamaV3's MoE helpers still depend on the full package.
+    if torch.version.hip is not None:
+        return 0
+
     if not is_exllama_available():
         return 0
-    import torch
 
     dtype = compute_dtype or torch.float16
     from .moe import (

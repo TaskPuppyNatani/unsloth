@@ -1356,7 +1356,8 @@ class FastModel(FastBaseModel):
                 prepare_exl3_checkpoint as _prepare_exl3_checkpoint,
             )
 
-            _require_exllama()
+            if torch.version.hip is None:
+                _require_exllama()
             token = hf_login(token)
             _exl3_compute_dtype = dtype if isinstance(dtype, torch.dtype) else None
             _exl3_plan = _prepare_exl3_checkpoint(

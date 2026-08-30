@@ -422,6 +422,24 @@ def patch_transformers_exl3(force: bool = False) -> bool:
     global _PATCHED
     if _PATCHED and not force:
         return True
+
+    try:
+        import torch
+        _rocm = torch.version.hip is not None
+    except Exception:
+        _rocm = False
+
+    if _rocm:
+        with _PATCH_LOCK:
+            if _PATCHED and not force:
+                return True
+            from .rocm_hf import patch_transformers_rocm_exl3
+
+            if not patch_transformers_rocm_exl3():
+                return False
+            _PATCHED = True
+            return True
+
     if not is_exllama_available():
         return False
 
