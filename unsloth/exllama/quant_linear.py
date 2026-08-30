@@ -50,12 +50,24 @@ def _inner_exl3(module: Any):
     """
     if module is None:
         return None
-    # Bare LinearEXL3 exposes get_weight_tensor directly.
-    if hasattr(module, "get_weight_tensor") and hasattr(module, "trellis"):
-        return module
+    # Bare LinearEXL3 exposes get_weight_tensor directly.  On ROCm we can also
+    # recognize the raw EXL3 tensor bundle without importing ExLlamaV3's full
+    # CUDA extension.
+    if hasattr(module, "trellis"):
+        if hasattr(module, "get_weight_tensor"):
+            return module
+        if (
+            torch.version.hip is not None
+            and hasattr(module, "suh")
+            and hasattr(module, "svh")
+        ):
+            return module
+
     inner = getattr(module, "inner", None)
-    if inner is not None and hasattr(inner, "get_weight_tensor"):
-        return inner
+    if inner is not None and inner is not module:
+        resolved = _inner_exl3(inner)
+        if resolved is not None:
+            return resolved
     # Unsloth's ExllamaV3Linear stores the source Exl3HfLinear / LinearEXL3 on
     # ``exl3_linear``; recurse into it (guard against self-reference).
     exl3_linear = getattr(module, "exl3_linear", None)
@@ -111,9 +123,19 @@ class Exl3QuantState:
         inner = _inner_exl3(self.exl3_linear)
         if inner is None:
             raise RuntimeError("Unsloth: EXL3 quant state has no reconstructable inner layer.")
+
+        out_dtype = dtype or self.dtype
+
+        if torch.version.hip is not None:
+            # ExLlamaV3's package import builds its complete CUDA extension,
+            # which is not portable to ROCm.  LoRA training only needs dense
+            # weight reconstruction, so use the narrow ROCm provider instead.
+            from .rocm_reconstruct import reconstruct_weight
+
+            return reconstruct_weight(inner, dtype = out_dtype)
+
         w = inner.get_weight_tensor()  # [in_features, out_features], fp16
         w = w.t().contiguous()  # -> [out_features, in_features]
-        out_dtype = dtype or self.dtype
         if out_dtype is not None and w.dtype != out_dtype:
             w = w.to(out_dtype)
         return w
