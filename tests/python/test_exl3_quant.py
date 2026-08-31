@@ -17,6 +17,20 @@ from unsloth.exllama.quant_linear import (
 )
 
 
+_ORIGINAL_TORCH_HIP = torch.version.hip
+
+
+def setUpModule():
+    # These mocks implement ExLlamaV3's CUDA get_weight_tensor() contract and
+    # deliberately have CPU-only, non-EXL3 trellis placeholders. On a ROCm
+    # development host, isolate this GPU-free suite from the real HIP provider.
+    torch.version.hip = None
+
+
+def tearDownModule():
+    torch.version.hip = _ORIGINAL_TORCH_HIP
+
+
 class _MockInnerExl3:
     """Stands in for exllamav3.modules.quant.exl3.LinearEXL3.
 

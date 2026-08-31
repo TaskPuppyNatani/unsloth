@@ -20,43 +20,14 @@ Return convention:
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import os
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import torch
 
 
-_DEFAULT_BUILD_DIR = Path("/var/tmp/exl3-rocm-extension-build")
 _EXT = None
-
-
-def _extension_candidates() -> list[Path]:
-    exact = os.environ.get("UNSLOTH_EXL3_ROCM_EXTENSION")
-    if exact:
-        return [Path(exact)]
-
-    build_dir = Path(
-        os.environ.get(
-            "EXL3_ROCM_BUILD_DIR",
-            str(_DEFAULT_BUILD_DIR),
-        )
-    )
-    return sorted(build_dir.glob("*.so"))
-
-
-def _module_name(path: Path) -> str:
-    name = path.name
-
-    if ".cpython-" in name:
-        return name.split(".cpython-", 1)[0]
-    if ".abi3" in name:
-        return name.split(".abi3", 1)[0]
-
-    return name.rsplit(".so", 1)[0]
 
 
 def _load_extension():
@@ -71,41 +42,10 @@ def _load_extension():
             "PyTorch build."
         )
 
-    errors: list[str] = []
+    from .rocm_build import load_or_build_extension
 
-    for path in _extension_candidates():
-        if not path.is_file():
-            errors.append(f"{path}: file does not exist")
-            continue
-
-        try:
-            spec = importlib.util.spec_from_file_location(
-                _module_name(path),
-                path,
-            )
-            if spec is None or spec.loader is None:
-                errors.append(f"{path}: could not create import spec")
-                continue
-
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            if not hasattr(module, "reconstruct"):
-                errors.append(f"{path}: no reconstruct() entry point")
-                continue
-
-            _EXT = module
-            return module
-
-        except Exception as exc:
-            errors.append(f"{path}: {exc}")
-
-    detail = "\n".join(errors) if errors else "no candidate extension found"
-
-    raise RuntimeError(
-        "Unsloth: EXL3 ROCm reconstruction extension could not be loaded.\n"
-        f"{detail}"
-    )
+    _EXT = load_or_build_extension()
+    return _EXT
 
 
 @lru_cache(maxsize=8)
