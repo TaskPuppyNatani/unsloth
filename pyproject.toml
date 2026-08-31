@@ -1502,6 +1502,8 @@ pythonpath = ["."]
 # turns the existing annotations on.
 markers = [
     "gpu: needs a real accelerator, and usually downloads a checkpoint to use it",
+    "rocm: needs a ROCm PyTorch build and a visible AMD GPU",
+    "exl3_real_model: needs the configured local prequantized EXL3 checkpoint",
     "slow: minutes rather than seconds, and covered again more cheaply elsewhere",
 ]
 

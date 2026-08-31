@@ -181,5 +181,37 @@ class TestForwardUsesReconstruction(unittest.TestCase):
         self.assertFalse(torch.allclose(out.float(), torch.full_like(out.float(), 999.0)))
 
 
+class TestAutogradCompatibility(unittest.TestCase):
+    """Reconstructed base weights must be ordinary tensors, not inference tensors."""
+
+    def test_matmul_lora_backward_can_save_reconstructed_weight(self):
+        from unsloth.kernels.utils import matmul_lora
+
+        in_f, out_f, rank = 5, 8, 3
+        inner = _MockInnerExl3(in_f, out_f)
+        qs = Exl3QuantState(
+            inner,
+            in_features = in_f,
+            out_features = out_f,
+            compute_dtype = torch.float32,
+        )
+        placeholder = torch.zeros((out_f, 1), dtype = torch.float32)
+        placeholder.quant_state = qs
+        x = torch.randn((2, 4, in_f), dtype = torch.float32, requires_grad = True)
+        A = torch.nn.Parameter(torch.randn((rank, in_f), dtype = torch.float32) * 0.01)
+        B = torch.nn.Parameter(torch.randn((out_f, rank), dtype = torch.float32) * 0.01)
+
+        reconstructed = qs.dequantize(dtype = torch.float32)
+        self.assertFalse(reconstructed.is_inference())
+
+        output = matmul_lora(x, placeholder, qs, A, B, 2.0)
+        output.square().mean().backward()
+
+        for name, tensor in (("input", x), ("LoRA A", A), ("LoRA B", B)):
+            self.assertIsNotNone(tensor.grad, f"{name} gradient missing")
+            self.assertTrue(torch.isfinite(tensor.grad).all(), f"{name} gradient non-finite")
+            self.assertGreater(tensor.grad.float().norm().item(), 0.0, f"{name} gradient zero")
+
+
 if __name__ == "__main__":
     unittest.main()
