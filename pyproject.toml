@@ -49,6 +49,16 @@ version = {attr = "unsloth._version.__version__"}
 include-package-data = true
 
 [tool.setuptools.package-data]
+"unsloth.exllama" = [
+    "rocm_ext/reconstruct_rocm.cpp",
+    "rocm_ext/reconstruct_rocm.cu",
+    "rocm_ext/reconstruct_rocm.h",
+    "rocm_ext/portable_decode_device.cuh",
+    "rocm_ext/portable_codebook.h",
+    "rocm_ext/portable_bitops.h",
+    "rocm_ext/LICENSE.exllamav3",
+    "rocm_ext/NOTICE.md",
+]
 unsloth_cli = ["codex_fallback_prompt.md", "pi_subagent.ts"]
 studio = [
     "*.sh",

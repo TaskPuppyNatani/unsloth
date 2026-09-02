@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,26 +107,67 @@ def _group_for_prefix(index: dict[str, dict], prefix: str) -> dict[str, dict]:
     group = {
         key: meta
         for key, meta in index.items()
-        if key.startswith(prefix + ".")
-        and key.rsplit(".", 1)[-1] in _EXL3_SUFFIXES
+        if key.rsplit(".", 1)[0] == prefix and key.rsplit(".", 1)[-1] in _EXL3_SUFFIXES
     }
 
     if f"{prefix}.trellis" not in group:
         return {}
 
-    if (
-        f"{prefix}.suh" not in group
-        and f"{prefix}.su" not in group
-    ):
+    if f"{prefix}.suh" not in group and f"{prefix}.su" not in group:
         return {}
 
-    if (
-        f"{prefix}.svh" not in group
-        and f"{prefix}.sv" not in group
-    ):
+    if f"{prefix}.svh" not in group and f"{prefix}.sv" not in group:
         return {}
 
     return group
+
+
+def _validate_checkpoint_index(index: dict[str, dict]) -> set[str]:
+    # A standalone bias also belongs to ordinary dense/norm layers and is not
+    # evidence of EXL3. Include it in groups only when EXL3-specific metadata
+    # establishes the prefix; all other recognized suffixes establish groups.
+    prefixes = {
+        key.rsplit(".", 1)[0]
+        for key in index
+        if key.rsplit(".", 1)[-1] in _EXL3_SUFFIXES and key.rsplit(".", 1)[-1] != "bias"
+    }
+    if not prefixes:
+        raise RuntimeError(
+            "Unsloth: the ROCm EXL3 loader found no pre-quantized EXL3 "
+            "trellis tensors in the checkpoint. ROCm currently requires a "
+            "pre-quantized dense EXL3 checkpoint; dense-to-EXL3 conversion "
+            "is not supported."
+        )
+
+    for prefix in sorted(prefixes):
+        missing = []
+        if f"{prefix}.trellis" not in index:
+            missing.append("trellis")
+        if f"{prefix}.suh" not in index and f"{prefix}.su" not in index:
+            missing.append("suh or su")
+        if f"{prefix}.svh" not in index and f"{prefix}.sv" not in index:
+            missing.append("svh or sv")
+        if missing:
+            raise RuntimeError(
+                f"Unsloth: malformed EXL3 tensor group {prefix!r}; missing {', '.join(missing)}."
+            )
+        if f"{prefix}.mcg" in index and f"{prefix}.mul1" in index:
+            raise RuntimeError(
+                f"Unsloth: malformed EXL3 tensor group {prefix!r}; mcg and "
+                "mul1 codebooks are mutually exclusive."
+            )
+    return prefixes
+
+
+def _ignore_expected_dense_weight_diagnostics(model, module_names) -> None:
+    """Filter only placeholder weights for proven EXL3 replacements."""
+
+    patterns = list(getattr(model, "_keys_to_ignore_on_load_missing", None) or ())
+    for name in sorted(module_names):
+        pattern = rf"^{re.escape(name)}\.weight$"
+        if pattern not in patterns:
+            patterns.append(pattern)
+    model._keys_to_ignore_on_load_missing = patterns
 
 
 def _meta_tensor(meta: Optional[dict]):
@@ -189,11 +231,7 @@ class RocmExl3HfLinear(torch.nn.Module):
         from .rocm_reconstruct import reconstruct_weight
 
         weight = reconstruct_weight(self, dtype=x.dtype).to(x.device)
-        bias = (
-            self.bias.to(device=x.device, dtype=x.dtype)
-            if self.bias is not None
-            else None
-        )
+        bias = self.bias.to(device=x.device, dtype=x.dtype) if self.bias is not None else None
         return torch.nn.functional.linear(x, weight, bias)
 
 
@@ -219,7 +257,10 @@ class RocmExl3HfQuantizer(HfQuantizer):
     def validate_environment(self, *args, **kwargs):
         if not torch.cuda.is_available() or torch.version.hip is None:
             raise RuntimeError(
-                "Unsloth: ROCm EXL3 loader requires a ROCm-enabled GPU."
+                "Unsloth: ROCm EXL3 loader requires a ROCm-enabled GPU: use "
+                "a ROCm-enabled PyTorch build and ensure the AMD GPU is "
+                "visible. Verify torch.version.hip and "
+                "torch.cuda.is_available()."
             )
 
     def update_torch_dtype(self, torch_dtype):
@@ -229,13 +270,12 @@ class RocmExl3HfQuantizer(HfQuantizer):
         path = getattr(model, "name_or_path", None)
 
         if not path or not os.path.isdir(path):
-            raise ValueError(
-                "Unsloth: ROCm EXL3 model must be initialized "
-                "from a local directory."
-            )
+            raise ValueError("Unsloth: ROCm EXL3 model must be initialized from a local directory.")
 
         index = _scan_checkpoint(path)
+        checkpoint_prefixes = _validate_checkpoint_index(index)
         modules_to_replace = {}
+        consumed_prefixes = set()
 
         for name, module in tuple(model.named_modules()):
             if not isinstance(module, torch.nn.Linear):
@@ -244,16 +284,10 @@ class RocmExl3HfQuantizer(HfQuantizer):
             candidates = [name]
 
             if name.startswith("model.language_model."):
-                candidates.append(
-                    "language_model.model."
-                    + name[len("model.language_model."):]
-                )
+                candidates.append("language_model.model." + name[len("model.language_model.") :])
 
             if name.startswith("language_model.model."):
-                candidates.append(
-                    "model.language_model."
-                    + name[len("language_model.model."):]
-                )
+                candidates.append("model.language_model." + name[len("language_model.model.") :])
 
             matched_group = None
 
@@ -261,6 +295,7 @@ class RocmExl3HfQuantizer(HfQuantizer):
                 group = _group_for_prefix(index, candidate)
                 if group:
                     matched_group = group
+                    consumed_prefixes.add(candidate)
                     break
 
             if matched_group:
@@ -269,6 +304,38 @@ class RocmExl3HfQuantizer(HfQuantizer):
                     module.out_features,
                     matched_group,
                 )
+
+        if not modules_to_replace:
+            raise RuntimeError(
+                "Unsloth: EXL3 tensors were found, but none matched the "
+                "model's dense Linear modules. The checkpoint architecture "
+                "or tensor names are not supported by the lightweight ROCm "
+                "EXL3 loader."
+            )
+
+        # Some model classes intentionally omit auxiliary checkpoint heads
+        # (for example Qwen3.5 declares ^mtp.* unexpected keys as ignorable).
+        # Validate these groups above, then account for them only when the
+        # model's existing declaration covers every tensor and its dense
+        # weight counterpart. Never add a new unexpected-key suppression.
+        ignored_patterns = getattr(model, "_keys_to_ignore_on_load_unexpected", None) or ()
+        ignored_prefixes = {
+            prefix
+            for prefix in checkpoint_prefixes - consumed_prefixes
+            if all(
+                any(re.search(pattern, key) for pattern in ignored_patterns)
+                for key in (*_group_for_prefix(index, prefix), f"{prefix}.weight")
+            )
+        }
+        unconsumed = checkpoint_prefixes - consumed_prefixes - ignored_prefixes
+        if unconsumed:
+            raise RuntimeError(
+                "Unsloth: EXL3 checkpoint groups did not match any supported "
+                f"dense Linear module: {', '.join(sorted(unconsumed))}. "
+                "Check that the checkpoint config, architecture and tensor "
+                "names describe the same model; this layout is not supported "
+                "by the lightweight ROCm EXL3 loader."
+            )
 
         return modules_to_replace
 
@@ -299,6 +366,10 @@ class RocmExl3HfQuantizer(HfQuantizer):
     ):
         modules = self.get_modules_to_replace(model)
         self.replace_modules(model, None, modules)
+        installed = dict(model.named_modules())
+        if any(installed.get(name) is not replacement for name, replacement in modules.items()):
+            raise RuntimeError("Unsloth: ROCm EXL3 module replacement was incomplete.")
+        _ignore_expected_dense_weight_diagnostics(model, modules)
 
         config = kwargs.get("config")
         if config is not None:

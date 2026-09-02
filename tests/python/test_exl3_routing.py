@@ -244,6 +244,84 @@ class TestShouldUseExl3(unittest.TestCase):
             self.assertTrue(EL.should_use_exl3("/some/exl3/dir"))
 
 
+class TestRocmScopeErrors(unittest.TestCase):
+    def _prepare(self, model_dir, **patches):
+        import torch
+
+        with (
+            patch.object(torch.version, "hip", patches.get("hip", "7.1")),
+            patch.object(EL, "require_exllama", lambda: None),
+            patch.object(EL, "_resolve_local_dir", lambda *args, **kwargs: model_dir),
+            patch.object(EL, "is_moe_model", patches.get("is_moe", lambda path: False)),
+            patch.object(
+                EL,
+                "patch_transformers_exl3",
+                patches.get("patch_backend", lambda: True),
+            ),
+            patch.object(
+                EL,
+                "is_exl3_model_dir",
+                patches.get("is_exl3", lambda path: False),
+            ),
+        ):
+            return EL.prepare_exl3_checkpoint(model_dir)
+
+    def test_rocm_moe_is_rejected_actionably(self):
+        with self.assertRaisesRegex(ValueError, "pre-quantized dense.*MoE"):
+            self._prepare("/model", is_moe=lambda path: True)
+
+    def test_rocm_backend_registration_failure_is_actionable(self):
+        with self.assertRaisesRegex(RuntimeError, "lightweight ROCm EXL3 loader"):
+            self._prepare("/model", patch_backend=lambda: False)
+
+    def _assert_registration_cause(self, cause):
+        def fail():
+            raise cause
+
+        with self.assertRaisesRegex(RuntimeError, "lightweight ROCm EXL3 loader") as error:
+            self._prepare("/model", patch_backend=fail)
+        self.assertIs(error.exception.__cause__, cause)
+
+    def test_rocm_registration_import_error_preserves_cause(self):
+        self._assert_registration_cause(ImportError("missing quantizer dependency"))
+
+    def test_rocm_registration_native_load_error_preserves_cause(self):
+        self._assert_registration_cause(OSError("dependency shared library could not be loaded"))
+
+    def test_rocm_registration_programming_errors_propagate(self):
+        for cause in (
+            ValueError("bad registry value"),
+            RuntimeError("unexpected initialization bug"),
+        ):
+            with self.subTest(cause=cause):
+
+                def fail():
+                    raise cause
+
+                with self.assertRaises(type(cause)) as error:
+                    self._prepare("/model", patch_backend=fail)
+                self.assertIs(error.exception, cause)
+
+    def test_cuda_registration_exceptions_are_not_wrapped(self):
+        for cause in (ImportError("missing CUDA dependency"), OSError("CUDA shared library")):
+            with self.subTest(cause=cause):
+
+                def fail():
+                    raise cause
+
+                with self.assertRaises(type(cause)) as error:
+                    self._prepare("/model", hip=None, patch_backend=fail)
+                self.assertIs(error.exception, cause)
+
+    def test_cuda_false_registration_keeps_existing_error(self):
+        with self.assertRaisesRegex(RuntimeError, "Is exllamav3 installed correctly"):
+            self._prepare("/model", hip=None, patch_backend=lambda: False)
+
+    def test_rocm_dense_conversion_is_rejected_actionably(self):
+        with self.assertRaisesRegex(ValueError, "pre-quantized.*dense model"):
+            self._prepare("/model")
+
+
 class TestNonExl3QuantOptOut(unittest.TestCase):
     """Existing non-EXL3 quant configs / checkpoints / adapter repos opt out."""
 

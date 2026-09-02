@@ -21,6 +21,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,8 +32,7 @@ import torch
 
 _BUILD_SCHEMA = 2
 _EXTENSION_BASENAME = "exl3_rocm_reconstruct"
-_PROJECT_ROCM_HOME = Path("/opt/exl3-rocm/rocm-7.1.1")
-_PROJECT_NINJA = Path("/opt/exl3-rocm/tools-ninja/bin/ninja")
+_DEFAULT_ROCM_HOME = Path("/opt/rocm")
 _SOURCE_FILES = (
     "reconstruct_rocm.cpp",
     "reconstruct_rocm.cu",
@@ -42,6 +42,8 @@ _SOURCE_FILES = (
     "portable_bitops.h",
 )
 _ARCH_RE = re.compile(r"^gfx[0-9a-f]+(?::[a-z0-9_+\-]+)*$", re.IGNORECASE)
+# cpp_extension and os.environ are process-global even for different cache keys.
+_TORCH_BUILD_LOCK = threading.RLock()
 
 
 class RocmExtensionError(RuntimeError):
@@ -162,10 +164,19 @@ def detect_architectures() -> tuple[str, ...]:
     )
 
 
-def _validate_source_dir(path: Path) -> Path:
+def _validate_source_dir(path: Path, *, packaged: bool = False) -> Path:
     path = path.expanduser().resolve()
     missing = [name for name in _SOURCE_FILES if not (path / name).is_file()]
     if missing:
+        if packaged:
+            raise RocmExtensionError(
+                "Unsloth: packaged EXL3 ROCm reconstruction sources are "
+                f"incomplete at {path}; missing: {', '.join(missing)}. "
+                "Reinstall Unsloth from a distribution that includes "
+                "unsloth/exllama/rocm_ext, or set "
+                "UNSLOTH_EXL3_ROCM_SOURCE_DIR to a complete advanced/debug "
+                "source override."
+            )
         raise RocmExtensionError(
             f"Unsloth: EXL3 ROCm source directory {path} is incomplete; "
             f"missing: {', '.join(missing)}."
@@ -173,27 +184,20 @@ def _validate_source_dir(path: Path) -> Path:
     return path
 
 
+def _packaged_source_dir() -> Path:
+    """Return the native-source directory shipped beside this module."""
+
+    return Path(__file__).resolve().parent / "rocm_ext"
+
+
 def find_source_dir() -> Path:
-    """Locate bundled sources or the EXL3-ROCm prototype source directory."""
+    """Locate an explicit override or Unsloth's packaged native sources."""
 
     override = os.environ.get("UNSLOTH_EXL3_ROCM_SOURCE_DIR")
     if override:
         return _validate_source_dir(Path(override))
 
-    bundled = Path(__file__).resolve().with_name("rocm_ext")
-    if bundled.is_dir():
-        return _validate_source_dir(bundled)
-
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "experiments" / "single-layer" / "rocm_ext"
-        if candidate.is_dir():
-            return _validate_source_dir(candidate)
-
-    raise RocmExtensionError(
-        "Unsloth: EXL3 ROCm reconstruction sources were not found. Set "
-        "UNSLOTH_EXL3_ROCM_SOURCE_DIR to the directory containing "
-        "reconstruct_rocm.cpp and reconstruct_rocm.cu."
-    )
+    return _validate_source_dir(_packaged_source_dir(), packaged=True)
 
 
 def source_fingerprint(source_dir: Path) -> str:
@@ -218,25 +222,21 @@ def select_rocm_home() -> Path:
     if override:
         return Path(override).expanduser().resolve()
 
-    if _PROJECT_ROCM_HOME.is_dir():
-        return _PROJECT_ROCM_HOME.resolve()
-
     for variable in ("ROCM_HOME", "ROCM_PATH"):
         value = os.environ.get(variable)
         if value:
             return Path(value).expanduser().resolve()
 
-    # Keeping the configured path stable lets a valid cache remain addressable
-    # if the build toolchain is temporarily unmounted or unavailable.
-    return _PROJECT_ROCM_HOME.resolve()
+    # Keep the default stable so a compatible cache remains addressable even
+    # when build-only tools are temporarily unavailable. Non-standard ROCm
+    # layouts should set UNSLOTH_EXL3_ROCM_HOME explicitly.
+    return _DEFAULT_ROCM_HOME.resolve()
 
 
 def resolve_ninja() -> Path:
     override = os.environ.get("UNSLOTH_EXL3_ROCM_NINJA")
     if override:
         candidate = Path(override).expanduser().resolve()
-    elif _PROJECT_NINJA.is_file():
-        candidate = _PROJECT_NINJA
     else:
         found = shutil.which("ninja")
         candidate = Path(found).resolve() if found else Path("ninja")
@@ -445,14 +445,38 @@ def _build_environment(
                 os.environ[key] = value
 
 
+@contextmanager
+def _hip_build_environment(tools: BuildTools, architectures: tuple[str, ...]) -> Iterator[Any]:
+    """Temporarily select HIP in fresh or previously imported PyTorch utilities."""
+
+    _require_rocm()
+    with _TORCH_BUILD_LOCK:
+        # Import before changing the environment so even a fresh import's
+        # original discovery state can be restored after this build.
+        from torch.utils import cpp_extension
+
+        updates = {
+            "ROCM_HOME": str(tools.rocm_home),
+            "HIP_HOME": str(tools.rocm_home / "hip"),
+            "IS_HIP_EXTENSION": True,
+        }
+        previous = {name: getattr(cpp_extension, name) for name in updates}
+        try:
+            with _build_environment(tools.rocm_home, tools.ninja, architectures):
+                for name, value in updates.items():
+                    setattr(cpp_extension, name, value)
+                yield cpp_extension
+        finally:
+            for name, value in previous.items():
+                setattr(cpp_extension, name, value)
+
+
 def _compile_extension(
     context: BuildContext,
     source_dir: Path,
     tools: BuildTools,
     build_dir: Path,
 ) -> Any:
-    from torch.utils import cpp_extension
-
     # PyTorch hipify can place generated siblings beside source files supplied
     # from outside build_directory. Stage an exact copy in the compatibility
     # cache so a first build never writes generated *_hip files to the checkout.
@@ -461,29 +485,20 @@ def _compile_extension(
     for name in _SOURCE_FILES:
         shutil.copyfile(source_dir / name, staged_source_dir / name)
 
-    previous_rocm_home = cpp_extension.ROCM_HOME
-    cpp_extension.ROCM_HOME = str(tools.rocm_home)
-    try:
-        with _build_environment(
-            tools.rocm_home,
-            tools.ninja,
-            context.architectures,
-        ):
-            return cpp_extension.load(
-                name=context.module_name,
-                sources=[
-                    str(staged_source_dir / "reconstruct_rocm.cpp"),
-                    str(staged_source_dir / "reconstruct_rocm.cu"),
-                ],
-                extra_include_paths=[str(staged_source_dir)],
-                extra_cflags=["-O2"],
-                extra_cuda_cflags=["-O2"],
-                build_directory=str(build_dir),
-                with_cuda=True,
-                verbose=os.environ.get("UNSLOTH_EXL3_ROCM_VERBOSE", "0") == "1",
-            )
-    finally:
-        cpp_extension.ROCM_HOME = previous_rocm_home
+    with _hip_build_environment(tools, context.architectures) as cpp_extension:
+        return cpp_extension.load(
+            name=context.module_name,
+            sources=[
+                str(staged_source_dir / "reconstruct_rocm.cpp"),
+                str(staged_source_dir / "reconstruct_rocm.cu"),
+            ],
+            extra_include_paths=[str(staged_source_dir)],
+            extra_cflags=["-O2"],
+            extra_cuda_cflags=["-O2"],
+            build_directory=str(build_dir),
+            with_cuda=True,
+            verbose=os.environ.get("UNSLOTH_EXL3_ROCM_VERBOSE", "0") == "1",
+        )
 
 
 def _validate_module(module: Any, *, label: str) -> Any:

@@ -26,7 +26,7 @@ from .patcher import (
     patch_transformers_exl3,
     read_exl3_bitrate,
 )
-from .quantize import quantize_to_exl3
+from .quantize import is_moe_model, quantize_to_exl3
 from .utils import is_exllama_available, require_exllama
 
 
@@ -277,8 +277,31 @@ def prepare_exl3_checkpoint(
         local_files_only = local_files_only,
     )
 
+    if _rocm and is_moe_model(local_dir):
+        raise ValueError(
+            "Unsloth: the ROCm EXL3 path supports pre-quantized dense "
+            "checkpoints only. EXL3 MoE loading and training are not yet "
+            "supported on ROCm. Use a supported dense EXL3 checkpoint or a "
+            "non-EXL3 backend for this MoE model."
+        )
+
     # Register the EXL3 quantizer with transformers up front.
-    if not patch_transformers_exl3():
+    if _rocm:
+        registration_error = (
+            "Unsloth: the lightweight ROCm EXL3 loader could not be "
+            "registered/loaded. Verify that this Unsloth distribution includes "
+            "the ROCm EXL3 backend and that the installed Transformers "
+            "version and its dependencies are compatible."
+        )
+        try:
+            registered = patch_transformers_exl3()
+        except (ImportError, OSError) as exc:
+            # Missing Python dependencies and native-library initialization
+            # failures need context. Programming errors still propagate.
+            raise RuntimeError(registration_error) from exc
+        if not registered:
+            raise RuntimeError(registration_error)
+    elif not patch_transformers_exl3():
         raise RuntimeError(
             "Unsloth: failed to register the EXL3 quantizer with transformers. "
             "Is exllamav3 installed correctly?"

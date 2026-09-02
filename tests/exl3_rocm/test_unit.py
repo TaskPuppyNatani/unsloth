@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -113,6 +114,152 @@ def test_group_accepts_packed_sign_vectors_and_respects_prefix_boundary():
     assert set(group) == {f"{prefix}.trellis", f"{prefix}.su", f"{prefix}.sv"}
 
 
+def test_checkpoint_index_requires_prequantized_trellis():
+    with pytest.raises(RuntimeError, match="no pre-quantized EXL3 trellis"):
+        rocm_hf._validate_checkpoint_index({})
+
+
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    (("suh", "suh or su"), ("svh", "svh or sv")),
+)
+def test_checkpoint_index_rejects_incomplete_tensor_group(missing, message):
+    index = _group()
+    index.pop(f"model.layer.proj.{missing}")
+
+    with pytest.raises(RuntimeError, match=message):
+        rocm_hf._validate_checkpoint_index(index)
+
+
+def test_checkpoint_index_rejects_conflicting_codebooks():
+    index = _group()
+    index["model.layer.proj.mcg"] = {
+        "shape": [],
+        "torch_dtype": torch.int32,
+    }
+
+    with pytest.raises(RuntimeError, match="mutually exclusive"):
+        rocm_hf._validate_checkpoint_index(index)
+
+
+@pytest.mark.parametrize("suffix", ("suh", "svh", "su", "sv", "mcg", "mul1"))
+def test_orphan_exl3_metadata_requires_trellis(suffix):
+    with pytest.raises(RuntimeError, match="malformed.*orphan.*missing trellis"):
+        rocm_hf._validate_checkpoint_index(
+            {f"orphan.{suffix}": {"shape": [128], "torch_dtype": torch.float16}}
+        )
+
+
+def _model_with_checkpoint(tmp_path, index):
+    dtype_names = {torch.int16: "I16", torch.int32: "I32", torch.float16: "F16"}
+    _write_safetensors_header(
+        tmp_path / "model.safetensors",
+        {
+            key: {"shape": meta["shape"], "dtype": dtype_names[meta["torch_dtype"]]}
+            for key, meta in index.items()
+        },
+    )
+    model = torch.nn.Module()
+    model.name_or_path = str(tmp_path)
+    model.good = torch.nn.Linear(128, 128, bias=False)
+    model.second = torch.nn.Linear(128, 128, bias=False)
+    return model, rocm_hf.RocmExl3HfQuantizer(rocm_hf.RocmExl3Config())
+
+
+def test_valid_group_does_not_hide_second_group_missing_trellis(tmp_path):
+    index = _group("good") | _group("second")
+    index.pop("second.trellis")
+    model, quantizer = _model_with_checkpoint(tmp_path, index)
+
+    with pytest.raises(RuntimeError, match="malformed.*second.*missing trellis"):
+        quantizer._process_model_before_weight_loading(model)
+
+    assert isinstance(model.good, torch.nn.Linear)
+    assert isinstance(model.second, torch.nn.Linear)
+    assert not getattr(model, "_keys_to_ignore_on_load_missing", None)
+
+
+def test_valid_match_does_not_hide_complete_unmatched_group(tmp_path):
+    model, quantizer = _model_with_checkpoint(tmp_path, _group("good") | _group("checkpoint_only"))
+
+    with pytest.raises(RuntimeError, match="did not match.*checkpoint_only"):
+        quantizer._process_model_before_weight_loading(model)
+
+    assert isinstance(model.good, torch.nn.Linear)
+    assert not getattr(model, "_keys_to_ignore_on_load_missing", None)
+
+
+def test_valid_multiple_groups_accept_dense_bias_and_weight(tmp_path):
+    index = _group("good") | _group("second")
+    index["dense.bias"] = {"shape": [128], "torch_dtype": torch.float16}
+    index["dense.weight"] = {"shape": [128, 128], "torch_dtype": torch.float16}
+    model, quantizer = _model_with_checkpoint(tmp_path, index)
+    model.dense = torch.nn.Linear(128, 128)
+
+    quantizer._process_model_before_weight_loading(model)
+
+    assert isinstance(model.good, rocm_hf.RocmExl3HfLinear)
+    assert isinstance(model.second, rocm_hf.RocmExl3HfLinear)
+    assert isinstance(model.dense, torch.nn.Linear)
+    assert set(model._keys_to_ignore_on_load_missing) == {r"^good\.weight$", r"^second\.weight$"}
+
+
+def test_declared_auxiliary_groups_are_validated_and_accounted_for(tmp_path):
+    model, quantizer = _model_with_checkpoint(tmp_path, _group("good") | _group("mtp.fc"))
+    model._keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
+
+    quantizer._process_model_before_weight_loading(model)
+
+    assert isinstance(model.good, rocm_hf.RocmExl3HfLinear)
+    assert isinstance(model.second, torch.nn.Linear)
+    assert model._keys_to_ignore_on_load_missing == [r"^good\.weight$"]
+    assert model._keys_to_ignore_on_load_unexpected == [r"^mtp.*"]
+
+
+@pytest.mark.parametrize("pattern", (r"^other\.", r"^mtp\.fc\.trellis$", r"^mtp\.fc\.(?!weight$)"))
+def test_auxiliary_ignore_must_cover_the_complete_group_and_dense_weight(tmp_path, pattern):
+    model, quantizer = _model_with_checkpoint(tmp_path, _group("good") | _group("mtp.fc"))
+    model._keys_to_ignore_on_load_unexpected = [pattern]
+
+    with pytest.raises(RuntimeError, match="did not match.*mtp.fc"):
+        quantizer._process_model_before_weight_loading(model)
+    assert isinstance(model.good, torch.nn.Linear)
+    assert not getattr(model, "_keys_to_ignore_on_load_missing", None)
+
+
+@pytest.mark.parametrize("malformation", ("missing_trellis", "conflicting_codebooks"))
+def test_declared_auxiliary_groups_cannot_hide_malformed_metadata(tmp_path, malformation):
+    index = _group("good") | _group("mtp.fc")
+    if malformation == "missing_trellis":
+        index.pop("mtp.fc.trellis")
+    else:
+        index["mtp.fc.mcg"] = {"shape": [], "torch_dtype": torch.int32}
+    model, quantizer = _model_with_checkpoint(tmp_path, index)
+    model._keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
+
+    with pytest.raises(RuntimeError, match="malformed.*mtp.fc"):
+        quantizer._process_model_before_weight_loading(model)
+    assert isinstance(model.good, torch.nn.Linear)
+    assert not getattr(model, "_keys_to_ignore_on_load_missing", None)
+
+
+def test_only_ignored_auxiliary_groups_do_not_count_as_model_replacements(tmp_path):
+    model, quantizer = _model_with_checkpoint(tmp_path, _group("mtp.fc"))
+    model._keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
+
+    with pytest.raises(RuntimeError, match="none matched"):
+        quantizer._process_model_before_weight_loading(model)
+
+
+def test_failed_replacement_does_not_install_missing_weight_filter(tmp_path, monkeypatch):
+    model, quantizer = _model_with_checkpoint(tmp_path, _group("good"))
+    monkeypatch.setattr(quantizer, "replace_modules", lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="module replacement was incomplete"):
+        quantizer._process_model_before_weight_loading(model)
+    assert not getattr(model, "_keys_to_ignore_on_load_missing", None)
+
+
 def test_meta_holder_preserves_shapes_dtypes_and_frozen_weight():
     holder = rocm_hf.RocmExl3HfLinear(128, 128, _group())
 
@@ -147,12 +294,15 @@ def test_quantizer_discovers_alias_and_replaces_only_complete_linear(tmp_path):
     model.model.language_model.unquantized = torch.nn.Linear(4, 4, bias=False)
     quantizer = rocm_hf.RocmExl3HfQuantizer(rocm_hf.RocmExl3Config())
 
-    replacements = quantizer.get_modules_to_replace(model)
-    quantizer.replace_modules(model, None, replacements)
+    quantizer._process_model_before_weight_loading(model)
 
-    assert set(replacements) == {"model.language_model.proj"}
     assert isinstance(model.model.language_model.proj, rocm_hf.RocmExl3HfLinear)
     assert isinstance(model.model.language_model.unquantized, torch.nn.Linear)
+    patterns = model._keys_to_ignore_on_load_missing
+    assert r"^model\.language_model\.proj\.weight$" in patterns
+    combined = re.compile("|".join(f"({pattern})" for pattern in patterns))
+    assert combined.search("model.language_model.proj.weight")
+    assert not combined.search("model.language_model.unquantized.weight")
 
 
 @pytest.mark.parametrize(("hip_version", "gpu_available"), ((None, True), ("7.1", False)))

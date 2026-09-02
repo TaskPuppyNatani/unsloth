@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +44,15 @@ def _source_tree(root: Path) -> Path:
     for index, name in enumerate(rocm_build._SOURCE_FILES):
         (root / name).write_text(f"source-{index}\n", encoding="utf-8")
     return root
+
+
+def _load_build_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_non_rocm_pytorch_is_rejected(monkeypatch):
@@ -86,6 +96,89 @@ def test_source_fingerprint_changes_with_source(tmp_path):
     assert rocm_build.source_fingerprint(source_dir) != before
 
 
+def test_packaged_sources_are_the_default(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_EXL3_ROCM_SOURCE_DIR", raising=False)
+
+    source_dir = rocm_build.find_source_dir()
+
+    assert source_dir == MODULE_PATH.parent / "rocm_ext"
+    assert {path.name for path in source_dir.iterdir() if path.is_file()} == set(
+        rocm_build._SOURCE_FILES
+    ) | {"LICENSE.exllamav3", "NOTICE.md"}
+    assert "experiments" not in source_dir.parts
+
+
+def test_source_fingerprint_changes_when_packaged_source_changes(monkeypatch, tmp_path):
+    monkeypatch.delenv("UNSLOTH_EXL3_ROCM_SOURCE_DIR", raising=False)
+    staged = tmp_path / "installed" / "unsloth" / "exllama" / "rocm_ext"
+    shutil.copytree(rocm_build.find_source_dir(), staged)
+    before = rocm_build.source_fingerprint(staged)
+    source = staged / "portable_bitops.h"
+    source.write_text(source.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+
+    assert rocm_build.source_fingerprint(staged) != before
+
+
+def test_explicit_source_override_wins(monkeypatch, tmp_path):
+    override = _source_tree(tmp_path / "override")
+    monkeypatch.setenv("UNSLOTH_EXL3_ROCM_SOURCE_DIR", str(override))
+
+    assert rocm_build.find_source_dir() == override
+
+
+def test_missing_packaged_sources_error_is_actionable(monkeypatch, tmp_path):
+    missing = tmp_path / "installed" / "unsloth" / "exllama" / "rocm_ext"
+    monkeypatch.delenv("UNSLOTH_EXL3_ROCM_SOURCE_DIR", raising=False)
+    monkeypatch.setattr(rocm_build, "_packaged_source_dir", lambda: missing)
+
+    with pytest.raises(rocm_build.RocmExtensionError, match="packaged.*incomplete") as error:
+        rocm_build.find_source_dir()
+
+    message = str(error.value)
+    assert "Reinstall Unsloth" in message
+    assert "UNSLOTH_EXL3_ROCM_SOURCE_DIR" in message
+
+
+def test_package_relative_lookup_works_from_staged_tree(monkeypatch, tmp_path):
+    package_dir = tmp_path / "wheel-root" / "unsloth" / "exllama"
+    native_dir = package_dir / "rocm_ext"
+    package_dir.mkdir(parents=True)
+    shutil.copyfile(MODULE_PATH, package_dir / MODULE_PATH.name)
+    _source_tree(native_dir)
+    monkeypatch.delenv("UNSLOTH_EXL3_ROCM_SOURCE_DIR", raising=False)
+
+    staged = _load_build_module(
+        package_dir / MODULE_PATH.name,
+        "_test_staged_exl3_rocm_build",
+    )
+
+    assert staged.find_source_dir() == native_dir
+
+
+def test_package_data_declares_every_native_source_and_notice():
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.9/3.10 test jobs.
+        from setuptools._vendor import tomli as tomllib
+
+    pyproject = MODULE_PATH.parents[2] / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    declared = set(data["tool"]["setuptools"]["package-data"]["unsloth.exllama"])
+
+    notices = {"LICENSE.exllamav3", "NOTICE.md"}
+    assert declared == {f"rocm_ext/{name}" for name in (*rocm_build._SOURCE_FILES, *notices)}
+    source_dir = MODULE_PATH.parent / "rocm_ext"
+    license_text = (source_dir / "LICENSE.exllamav3").read_text(encoding="utf-8")
+    assert "Copyright (c) 2025 Turboderp" in license_text
+    assert "Permission is hereby granted, free of charge" in license_text
+    assert "copies or substantial portions of the Software" in license_text
+    assert 'THE SOFTWARE IS PROVIDED "AS IS"' in license_text
+    assert "0c49587a7c235e6303a6bbedc8b665272ad3a2ea" in (source_dir / "NOTICE.md").read_text(
+        encoding="utf-8"
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -123,6 +216,80 @@ def test_missing_toolchain_error_is_actionable(monkeypatch, tmp_path):
         rocm_build.resolve_build_tools(context)
 
     assert str(missing) in str(error.value)
+
+
+@pytest.mark.parametrize("already_imported", (False, True))
+@pytest.mark.parametrize("fail_inside", (False, True))
+def test_nonstandard_override_selects_real_pytorch_hip_linkage(already_imported, fail_inside):
+    # A subprocess prevents the test harness's own cpp_extension imports from
+    # making the fresh-import case accidentally exercise an already loaded one.
+    code = f"""
+import importlib.util
+import inspect
+import os
+import shutil
+import sys
+from pathlib import Path
+from unittest.mock import patch
+import torch
+
+torch.version.hip = "7.1.0"
+os.environ.pop("ROCM_HOME", None)
+os.environ.pop("ROCM_PATH", None)
+os.environ["UNSLOTH_EXL3_ROCM_HOME"] = "/nonstandard/review-rocm"
+os.environ["PYTORCH_ROCM_ARCH"] = "gfx1100"
+os.environ.pop("UNSLOTH_EXL3_ROCM_SOURCE_DIR", None)
+spec = importlib.util.spec_from_file_location("_override_build", {str(MODULE_PATH)!r})
+builder = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = builder
+spec.loader.exec_module(builder)
+original_which = shutil.which
+original_exists = os.path.exists
+def which(name, *args, **kwargs):
+    return None if name == "hipcc" else original_which(name, *args, **kwargs)
+def exists(path):
+    return False if str(path) == "/opt/rocm" else original_exists(path)
+
+with patch.object(shutil, "which", which), patch.object(os.path, "exists", exists):
+    assert "torch.utils.cpp_extension" not in sys.modules
+    if {already_imported!r}:
+        from torch.utils import cpp_extension
+        assert cpp_extension.ROCM_HOME is None
+        assert cpp_extension.IS_HIP_EXTENSION is False
+    context, _ = builder.make_build_context()
+    assert context.rocm_home == "/nonstandard/review-rocm"
+    tools = builder.BuildTools(Path(context.rocm_home), Path(context.hipcc), "test", Path("/test/ninja"))
+    before_env = os.environ.copy()
+    try:
+        with builder._hip_build_environment(tools, context.architectures) as cpp_extension:
+            assert cpp_extension.ROCM_HOME == context.rocm_home
+            assert cpp_extension.HIP_HOME == context.rocm_home + "/hip"
+            assert cpp_extension.IS_HIP_EXTENSION is True
+            assert os.environ["ROCM_HOME"] == context.rocm_home
+            # Use PyTorch's real linkage preparation, not a mocked load result.
+            options = dict(extra_ldflags=[], with_cuda=True, with_sycl=False, verbose=False, is_standalone=False)
+            signature = inspect.signature(cpp_extension._prepare_ldflags)
+            flags = cpp_extension._prepare_ldflags(**{{k:v for k,v in options.items() if k in signature.parameters}})
+            assert "-lc10_hip" in flags and "-ltorch_hip" in flags
+            assert "-lamdhip64" in flags
+            assert "-lc10_cuda" not in flags and "-ltorch_cuda" not in flags
+            assert "-lcudart" not in flags
+            if {fail_inside!r}:
+                raise RuntimeError("simulated build failure")
+    except RuntimeError as exc:
+        assert {fail_inside!r} and str(exc) == "simulated build failure"
+    assert os.environ == before_env
+    assert cpp_extension.ROCM_HOME is None
+    assert cpp_extension.HIP_HOME is None
+    assert cpp_extension.IS_HIP_EXTENSION is False
+    assert "exllamav3" not in sys.modules
+print("HIP linkage selected; environment and module state restored")
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HIP linkage selected" in result.stdout
 
 
 def test_explicit_prebuilt_extension_short_circuits_build(monkeypatch, tmp_path):
