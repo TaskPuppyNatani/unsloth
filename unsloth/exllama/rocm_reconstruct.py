@@ -189,39 +189,17 @@ def reconstruct_inner_weight(inner: Any) -> torch.Tensor:
         device=device,
     )
 
-    row_blocks = trellis.shape[0]
-    col_blocks = trellis.shape[1] // 8
-
-    for row_block in range(row_blocks):
-        row_start = row_block * 16
-
-        for col_block in range(col_blocks):
-            col_start = col_block * 128
-
-            packed = trellis[
-                row_block : row_block + 1,
-                col_block * 8 : (col_block + 1) * 8,
-                :,
-            ].contiguous()
-
-            tile = torch.empty(
-                (16, 128),
-                dtype=torch.float16,
-                device=device,
-            )
-
-            ext.reconstruct(
-                tile,
-                packed,
-                K,
-                mcg,
-                mul1,
-            )
-
-            weight[
-                row_start : row_start + 16,
-                col_start : col_start + 128,
-            ] = tile
+    # The ROCm binding natively maps the complete packed trellis to the complete
+    # [in, out] output. Keep the one-time contiguity conversion: the previous
+    # tiled path made each packed view contiguous, so this preserves support for
+    # an otherwise valid non-contiguous trellis without reintroducing tile calls.
+    ext.reconstruct(
+        weight,
+        trellis.contiguous(),
+        K,
+        mcg,
+        mul1,
+    )
 
     return weight
 

@@ -124,6 +124,60 @@ def test_reconstructed_weight_orientation_dtype_and_linear(extension_info, monke
     assert "exllamav3" not in sys.modules
 
 
+@pytest.mark.parametrize("mcg,mul1", ((False, False), (True, False), (False, True)))
+@pytest.mark.parametrize("noncontiguous", (False, True))
+def test_inner_reconstruction_dispatches_whole_trellis_once(
+    extension_info,
+    monkeypatch,
+    mcg,
+    mul1,
+    noncontiguous,
+):
+    from unsloth.exllama import rocm_reconstruct
+
+    class CountingExtension:
+        def __init__(self, module):
+            self.module = module
+            self.calls = []
+
+        def reconstruct(self, output, packed, bits, use_mcg, use_mul1):
+            self.calls.append(
+                (
+                    tuple(output.shape),
+                    tuple(packed.shape),
+                    packed.is_contiguous(),
+                    bits,
+                    use_mcg,
+                    use_mul1,
+                )
+            )
+            return self.module.reconstruct(output, packed, bits, use_mcg, use_mul1)
+
+    extension = CountingExtension(extension_info.module)
+    monkeypatch.setattr(rocm_reconstruct, "_EXT", extension)
+    inner = _synthetic_inner()
+    inner.mcg = mcg
+    inner.mul1 = mul1
+    if noncontiguous:
+        inner.trellis = inner.trellis.transpose(0, 1).contiguous().transpose(0, 1)
+        assert not inner.trellis.is_contiguous()
+    expected = torch.empty((128, 256), dtype=torch.float16, device="cuda")
+    extension_info.module.reconstruct(
+        expected,
+        inner.trellis.contiguous(),
+        inner.K,
+        mcg,
+        mul1,
+    )
+
+    actual = rocm_reconstruct.reconstruct_inner_weight(inner)
+
+    assert extension.calls == [((128, 256), (8, 16, 64), True, 4, mcg, mul1)]
+    assert actual.is_contiguous()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert "exllamav3" not in sys.modules
+
+
 def test_mutually_exclusive_codebooks_are_rejected(extension_info, monkeypatch):
     from unsloth.exllama import rocm_reconstruct
 
